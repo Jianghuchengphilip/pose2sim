@@ -16,6 +16,9 @@ import json
 import numpy as np
 import re
 import cv2
+import c3d
+import sys
+import itertools as it
 
 import matplotlib as mpl
 mpl.use('qt5agg')
@@ -23,7 +26,8 @@ mpl.rc('figure', max_open_warning=0)
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from PyQt5.QtWidgets import QMainWindow, QApplication, QWidget, QTabWidget, QVBoxLayout
-import sys
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="c3d")
 
 
 ## AUTHORSHIP INFORMATION
@@ -31,7 +35,7 @@ __author__ = "David Pagnon"
 __copyright__ = "Copyright 2021, Maya-Mocap"
 __credits__ = ["David Pagnon"]
 __license__ = "BSD 3-Clause License"
-__version__ = '0.6'
+__version__ = "0.9.4"
 __maintainer__ = "David Pagnon"
 __email__ = "contact@david-pagnon.com"
 __status__ = "Development"
@@ -109,17 +113,19 @@ def retrieve_calib_params(calib_file):
     
     calib = toml.load(calib_file)
 
+    cal_keys = [c for c in calib.keys() 
+                if c not in ['metadata', 'capture_volume', 'charuco', 'checkerboard'] 
+                and isinstance(calib[c],dict)]
     S, K, dist, optim_K, inv_K, R, R_mat, T = [], [], [], [], [], [], [], []
-    for c, cam in enumerate(calib.keys()):
-        if cam != 'metadata':
-            S.append(np.array(calib[cam]['size']))
-            K.append(np.array(calib[cam]['matrix']))
-            dist.append(np.array(calib[cam]['distortions']))
-            optim_K.append(cv2.getOptimalNewCameraMatrix(K[c], dist[c], [int(s) for s in S[c]], 1, [int(s) for s in S[c]])[0])
-            inv_K.append(np.linalg.inv(K[c]))
-            R.append(np.array(calib[cam]['rotation']))
-            R_mat.append(cv2.Rodrigues(R[c])[0])
-            T.append(np.array(calib[cam]['translation']))
+    for c, cam in enumerate(cal_keys):
+        S.append(np.array(calib[cam]['size']))
+        K.append(np.array(calib[cam]['matrix']))
+        dist.append(np.array(calib[cam]['distortions']))
+        optim_K.append(cv2.getOptimalNewCameraMatrix(K[c], dist[c], [int(s) for s in S[c]], 1, [int(s) for s in S[c]])[0])
+        inv_K.append(np.linalg.inv(K[c]))
+        R.append(np.array(calib[cam]['rotation']))
+        R_mat.append(cv2.Rodrigues(R[c])[0])
+        T.append(np.array(calib[cam]['translation']))
     calib_params = {'S': S, 'K': K, 'dist': dist, 'inv_K': inv_K, 'optim_K': optim_K, 'R': R, 'R_mat': R_mat, 'T': T}
             
     return calib_params
@@ -139,22 +145,24 @@ def computeP(calib_file, undistort=False):
     
     calib = toml.load(calib_file)
     
+    cal_keys = [c for c in calib.keys() 
+                if c not in ['metadata', 'capture_volume', 'charuco', 'checkerboard'] 
+                and isinstance(calib[c],dict)]
     P = []
-    for cam in list(calib.keys()):
-        if cam != 'metadata':
-            K = np.array(calib[cam]['matrix'])
-            if undistort:
-                S = np.array(calib[cam]['size'])
-                dist = np.array(calib[cam]['distortions'])
-                optim_K = cv2.getOptimalNewCameraMatrix(K, dist, [int(s) for s in S], 1, [int(s) for s in S])[0]
-                Kh = np.block([optim_K, np.zeros(3).reshape(3,1)])
-            else:
-                Kh = np.block([K, np.zeros(3).reshape(3,1)])
-            R, _ = cv2.Rodrigues(np.array(calib[cam]['rotation']))
-            T = np.array(calib[cam]['translation'])
-            H = np.block([[R,T.reshape(3,1)], [np.zeros(3), 1 ]])
-            
-            P.append(Kh @ H)
+    for cam in list(cal_keys):
+        K = np.array(calib[cam]['matrix'])
+        if undistort:
+            S = np.array(calib[cam]['size'])
+            dist = np.array(calib[cam]['distortions'])
+            optim_K = cv2.getOptimalNewCameraMatrix(K, dist, [int(s) for s in S], 1, [int(s) for s in S])[0]
+            Kh = np.block([optim_K, np.zeros(3).reshape(3,1)])
+        else:
+            Kh = np.block([K, np.zeros(3).reshape(3,1)])
+        R, _ = cv2.Rodrigues(np.array(calib[cam]['rotation']))
+        T = np.array(calib[cam]['translation'])
+        H = np.block([[R,T.reshape(3,1)], [np.zeros(3), 1 ]])
+        
+        P.append(Kh @ H)
    
     return P
 
@@ -208,7 +216,53 @@ def reprojection(P_all, Q):
         y_calc.append(P_cam[1] @ Q / (P_cam[2] @ Q))
         
     return x_calc, y_calc
-        
+
+
+def min_with_single_indices(L, T):
+    '''
+    Let L be a list (size s) with T associated tuple indices (size s).
+    Select the smallest values of L, considering that 
+    the next smallest value cannot have the same numbers 
+    in the associated tuple as any of the previous ones.
+
+    Example:
+    L = [  20,   27,  51,    33,   43,   23,   37,   24,   4,   68,   84,    3  ]
+    T = list(it.product(range(2),range(3)))
+      = [(0,0),(0,1),(0,2),(0,3),(1,0),(1,1),(1,2),(1,3),(2,0),(2,1),(2,2),(2,3)]
+
+    - 1st smallest value: 3 with tuple (2,3), index 11
+    - 2nd smallest value when excluding indices (2,.) and (.,3), i.e. [(0,0),(0,1),(0,2),X,(1,0),(1,1),(1,2),X,X,X,X,X]:
+    20 with tuple (0,0), index 0
+    - 3rd smallest value when excluding [X,X,X,X,X,(1,1),(1,2),X,X,X,X,X]:
+    23 with tuple (1,1), index 5
+    
+    INPUTS:
+    - L: list (size s)
+    - T: T associated tuple indices (size s)
+
+    OUTPUTS: 
+    - minL: list of smallest values of L, considering constraints on tuple indices
+    - argminL: list of indices of smallest values of L
+    - T_minL: list of tuples associated with smallest values of L
+    '''
+
+    minL = [np.nanmin(L)]
+    argminL = [np.nanargmin(L)]
+    T_minL = [T[argminL[0]]]
+    
+    mask_tokeep = np.array([True for t in T])
+    i=0
+    while mask_tokeep.any()==True:
+        mask_tokeep = mask_tokeep & np.array([t[0]!=T_minL[i][0] and t[1]!=T_minL[i][1] for t in T])
+        if mask_tokeep.any()==True:
+            indicesL_tokeep = np.where(mask_tokeep)[0]
+            minL += [np.nanmin(np.array(L)[indicesL_tokeep]) if not np.isnan(np.array(L)[indicesL_tokeep]).all() else np.nan]
+            argminL += [indicesL_tokeep[np.nanargmin(np.array(L)[indicesL_tokeep])] if not np.isnan(minL[-1]) else indicesL_tokeep[0]]
+            T_minL += (T[argminL[i+1]],)
+            i+=1
+    
+    return np.array(minL), np.array(argminL), np.array(T_minL)
+
 
 def euclidean_distance(q1, q2):
     '''
@@ -216,20 +270,133 @@ def euclidean_distance(q1, q2):
     
     INPUTS:
     - q1: list of N_dimensional coordinates of point
+         or list of N points of N_dimensional coordinates
     - q2: idem
 
     OUTPUTS:
     - euc_dist: float. Euclidian distance between q1 and q2
-    
     '''
     
     q1 = np.array(q1)
     q2 = np.array(q2)
     dist = q2 - q1
+    if np.isnan(dist).all():
+        dist =  np.empty_like(dist)
+        dist[...] = np.inf
     
-    euc_dist = np.sqrt(np.sum( [d**2 for d in dist]))
+    if len(dist.shape)==1:
+        euc_dist = np.sqrt(np.nansum( [d**2 for d in dist]))
+    else:
+        euc_dist = np.sqrt(np.nansum( [d**2 for d in dist], axis=1))
     
     return euc_dist
+
+
+def pad_shape(arr, target_len, fill_value=np.nan):
+    '''
+    Pads an array to the target length with specified fill values
+    
+    INPUTS:
+    - arr: Input array to be padded.
+    - target_len: The target length of the first dimension after padding.
+    - fill_value: The value to use for padding (default: np.nan).
+    
+    OUTPUTS:
+    - Padded array with shape (target_len, ...) matching the input dimensions.
+    '''
+
+    if len(arr) < target_len:
+        pad_shape = (target_len - len(arr),) + arr.shape[1:]
+        padding = np.full(pad_shape, fill_value)
+        return np.concatenate((arr, padding))
+    
+    return arr
+
+
+def sort_people_sports2d(keyptpre, keypt, scores=None):
+    '''
+    Associate persons across frames (Sports2D method)
+    Persons' indices are sometimes swapped when changing frame
+    A person is associated to another in the next frame when they are at a small distance
+    
+    N.B.: Requires min_with_single_indices and euclidian_distance function (see common.py)
+
+    INPUTS:
+    - keyptpre: (K, L, M) array of 2D coordinates for K persons in the previous frame, L keypoints, M 2D coordinates
+    - keypt: idem keyptpre, for current frame
+    - score: (K, L) array of confidence scores for K persons, L keypoints (optional) 
+    
+    OUTPUTS:
+    - sorted_prev_keypoints: array with reordered persons with values of previous frame if current is empty
+    - sorted_keypoints: array with reordered persons --> if scores is not None
+    - sorted_scores: array with reordered scores     --> if scores is not None
+    - associated_tuples: list of tuples with correspondences between persons across frames --> if scores is None (for Pose2Sim.triangulation())
+    '''
+    
+    # Generate possible person correspondences across frames
+    max_len = max(len(keyptpre), len(keypt))
+    keyptpre = pad_shape(keyptpre, max_len, fill_value=np.nan)
+    keypt = pad_shape(keypt, max_len, fill_value=np.nan)
+    if scores is not None:
+        scores = pad_shape(scores, max_len, fill_value=np.nan)
+    
+    # Compute distance between persons from one frame to another
+    personsIDs_comb = sorted(list(it.product(range(len(keyptpre)), range(len(keypt)))))
+    frame_by_frame_dist = [euclidean_distance(keyptpre[comb[0]],keypt[comb[1]]) for comb in personsIDs_comb]
+    frame_by_frame_dist = np.mean(frame_by_frame_dist, axis=1)
+    
+    # Sort correspondences by distance
+    _, _, associated_tuples = min_with_single_indices(frame_by_frame_dist, personsIDs_comb)
+    
+    # Associate points to same index across frames, nan if no correspondence
+    sorted_keypoints = []
+    for i in range(len(keyptpre)):
+        id_in_old =  associated_tuples[:,1][associated_tuples[:,0] == i].tolist()
+        if len(id_in_old) > 0:      sorted_keypoints += [keypt[id_in_old[0]]]
+        else:                       sorted_keypoints += [keypt[i]]
+    sorted_keypoints = np.array(sorted_keypoints)
+
+    if scores is not None:
+        sorted_scores = []
+        for i in range(len(keyptpre)):
+            id_in_old =  associated_tuples[:,1][associated_tuples[:,0] == i].tolist()
+            if len(id_in_old) > 0:  sorted_scores += [scores[id_in_old[0]]]
+            else:                   sorted_scores += [scores[i]]
+        sorted_scores = np.array(sorted_scores)
+
+    # Keep track of previous values even when missing for more than one frame
+    sorted_prev_keypoints = np.where(np.isnan(sorted_keypoints) & ~np.isnan(keyptpre), keyptpre, sorted_keypoints)
+    
+    if scores is not None:
+        return sorted_prev_keypoints, sorted_keypoints, sorted_scores
+    else: # For Pose2Sim.triangulation()
+        return sorted_keypoints, associated_tuples
+
+
+def trimmed_mean(arr, trimmed_extrema_percent=0.5):
+    '''
+    Trimmed mean calculation for an array.
+
+    INPUTS:
+    - arr (np.array): The input array.
+    - trimmed_extrema_percent (float): The percentage of values to be trimmed from both ends.
+
+    OUTPUTS:
+    - float: The trimmed mean of the array.
+    '''
+
+    # Sort the array
+    sorted_arr = np.sort(arr)
+    
+    # Determine the indices for the 25th and 75th percentiles (if trimmed_percent = 0.5)
+    lower_idx = int(len(sorted_arr) * (trimmed_extrema_percent/2))
+    upper_idx = int(len(sorted_arr) * (1 - trimmed_extrema_percent/2))
+    
+    # Slice the array to exclude the 25% lowest and highest values
+    trimmed_arr = sorted_arr[lower_idx:upper_idx]
+    
+    # Return the mean of the remaining values
+    return np.mean(trimmed_arr)
 
 
 def world_to_camera_persp(r, t):
@@ -334,17 +501,32 @@ def quat2mat(quat, scalar_idx=0):
     return mat
 
 
-def natural_sort(list): 
+def sort_stringlist_by_last_number(string_list):
     '''
-    Sorts list of strings with numbers in natural order
-    Example: ['item_1', 'item_2', 'item_10']
-    Taken from: https://stackoverflow.com/a/11150413/12196632
+    Sort a list of strings based on the last number in the string.
+    Works if other numbers in the string, if strings after number. Ignores alphabetical order.
+
+    Example: ['json1', 'zero', 'js4on2.b', 'aaaa', 'eypoints_0000003.json', 'ajson0', 'json10']
+    gives: ['ajson0', 'json1', 'js4on2.b', 'eypoints_0000003.json', 'json10', 'aaaa', 'zero']
     '''
 
-    convert = lambda text: int(text) if text.isdigit() else text.lower() 
-    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
+    def sort_by_last_number(s):
+        numbers = re.findall(r'\d+', s)
+        if numbers:
+            return (False, int(numbers[-1]))
+        else:
+            return (True, s)
     
-    return sorted(list, key=alphanum_key)
+    return sorted(string_list, key=sort_by_last_number)
+
+
+def natural_sort_key(s):
+    '''
+    Sorts list of strings with numbers in natural order (alphabetical and numerical)
+    Example: ['item_1', 'item_2', 'item_10', 'stuff_1']
+    '''
+    s=str(s)
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
 
 def zup2yup(Q):
@@ -366,6 +548,136 @@ def zup2yup(Q):
     return Q
     
 
+def extract_trc_data(trc_path):
+    '''
+    Extract marker names and coordinates from a trc file.
+
+    INPUTS:
+    - trc_path: Path to the trc file
+
+    OUTPUTS:
+    - marker_names: List of marker names
+    - marker_coords: Array of marker coordinates (n_frames, t+3*n_markers)
+    '''
+
+    # marker names
+    with open(trc_path, 'r') as file:
+        lines = file.readlines()
+        marker_names_line = lines[3]
+        marker_names = marker_names_line.strip().split('\t')[2::3]
+
+    # time and marker coordinates
+    trc_data_np = np.genfromtxt(trc_path, skip_header=5, delimiter = '\t')[:,1:] 
+
+    return marker_names, trc_data_np
+
+
+def create_c3d_file(c3d_path, marker_names, trc_data_np):
+    '''
+    Create a c3d file from the data extracted from a trc file.
+
+    INPUTS:
+    - c3d_path: Path to the c3d file
+    - marker_names: List of marker names
+    - trc_data_np: Array of marker coordinates (n_frames, t+3*n_markers)
+
+    OUTPUTS:
+    - c3d file
+    '''
+
+    # retrieve frame rate
+    times = trc_data_np[:,0]
+    frame_rate = round((len(times)-1) / (times[-1] - times[0]))
+
+    # write c3d file
+    writer = c3d.Writer(point_rate=frame_rate, analog_rate=0, point_scale=1.0, point_units='mm', gen_scale=-1.0)
+    writer.set_point_labels(marker_names)
+    writer.set_screen_axis(X='+Z', Y='+Y')
+    
+    for frame in trc_data_np:
+        residuals = np.full((len(marker_names), 1), 0.0)
+        cameras = np.zeros((len(marker_names), 1))
+        coords = frame[1:].reshape(-1,3)*1000
+        points = np.hstack((coords, residuals, cameras))
+        writer.add_frames([(points, np.array([]))])
+
+    writer.set_start_frame(0)
+    writer._set_last_frame(len(trc_data_np)-1)
+
+    with open(c3d_path, 'wb') as handle:
+        writer.write(handle)
+
+
+def convert_to_c3d(trc_path):
+    '''
+    Make Visual3D compatible c3d files from a trc path
+
+    INPUT:
+    - trc_path: string, trc file to convert
+
+    OUTPUT:
+    - c3d file
+    '''
+
+    c3d_path = trc_path.replace('.trc', '.c3d')
+    marker_names, trc_data_np = extract_trc_data(trc_path)
+    create_c3d_file(c3d_path, marker_names, trc_data_np)
+
+    return c3d_path
+
+
+def points_to_angles(points_list):
+    '''
+    If len(points_list)==2, computes clockwise angle of ab vector w.r.t. horizontal (e.g. RBigToe, RHeel) 
+    If len(points_list)==3, computes clockwise angle from a to c around b (e.g. Neck, Hip, Knee) 
+    If len(points_list)==4, computes clockwise angle between vectors ab and cd (e.g. Neck Hip, RKnee RHip)
+    
+    Points can be 2D or 3D.
+    If parameters are float, returns a float between 0.0 and 360.0
+    If parameters are arrays, returns an array of floats between 0.0 and 360.0
+
+    INPUTS:
+    '''
+
+    if len(points_list) < 2: # if not enough points, return None
+        return np.nan
+    
+    points_array = np.array(points_list)
+    dimensions = points_array.shape[-1]
+
+    if len(points_list) == 2:
+        vector_u = points_array[0] - points_array[1]
+        if len(points_array.shape)==2:
+            vector_v = np.array([1, 0, 0]) # Here vector X, could be any horizontal vector
+        else:
+            vector_v = np.array([[1, 0, 0],] * points_array.shape[1]) 
+
+    elif len(points_list) == 3:
+        vector_u = points_array[0] - points_array[1]
+        vector_v = points_array[2] - points_array[1]
+
+    elif len(points_list) == 4:
+        vector_u = points_array[1] - points_array[0]
+        vector_v = points_array[3] - points_array[2]
+
+    else:
+        return np.nan
+
+    if dimensions == 2: 
+        vector_u = vector_u[:2]
+        vector_v = vector_v[:2]
+        ang = np.arctan2(vector_u[1], vector_u[0]) - np.arctan2(vector_v[1], vector_v[0])
+    else:
+        cross_product = np.cross(vector_u, vector_v)
+        dot_product = np.einsum('ij,ij->i', vector_u, vector_v) # np.dot(vector_u, vector_v) # does not work with time series
+        ang = np.arctan2(np.linalg.norm(cross_product,axis=1), dot_product)
+
+    ang_deg = np.degrees(ang)
+    # ang_deg = np.array(np.degrees(np.unwrap(ang*2)/2))
+    
+    return ang_deg
+
+
 ## CLASSES
 class plotWindow():
     '''
@@ -383,9 +695,10 @@ class plotWindow():
     '''
 
     def __init__(self, parent=None):
-        self.app = QApplication(sys.argv)
+        self.app = QApplication.instance()
+        if not self.app:
+            self.app = QApplication(sys.argv)
         self.MainWindow = QMainWindow()
-        self.MainWindow.__init__()
         self.MainWindow.setWindowTitle("Multitabs figure")
         self.canvases = []
         self.figure_handles = []

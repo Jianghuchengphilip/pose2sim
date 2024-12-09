@@ -23,21 +23,22 @@ OUTPUT:
 ## INIT
 import os
 import numpy as np
-from Pose2Sim.MarkerAugmenter import utilsDataman
 import copy
 import tensorflow as tf
-from Pose2Sim.MarkerAugmenter.utils import TRC2numpy
-import json
 import glob
 import logging
 
+from Pose2Sim.MarkerAugmenter import utilsDataman
+from Pose2Sim.MarkerAugmenter.utils import TRC2numpy
+from Pose2Sim.common import convert_to_c3d, natural_sort_key
+
 
 ## AUTHORSHIP INFORMATION
-__author__ = "Antoine Falisse, adapted by HunMin Kim"
+__author__ = "Antoine Falisse, adapted by HunMin Kim and David Pagnon"
 __copyright__ = "Copyright 2022, OpenCap"
-__credits__ = ["Antoine Falisse", "HunMin Kim"]
+__credits__ = ["Antoine Falisse", "HunMin Kim", "David Pagnon"]
 __license__ = "Apache-2.0 License"
-__version__ = '0.5'
+__version__ = "0.9.4"
 __maintainer__ = "David Pagnon"
 __email__ = "contact@david-pagnon.com"
 __status__ = "Development"
@@ -45,10 +46,10 @@ __status__ = "Development"
 
 ## FUNCTIONS
 # subject_height must be in meters
-def get_midhip_data(trc_file):
+def check_midhip_data(trc_file):
     try:
         # Find MidHip data
-        midhip_data = trc_file.marker("CHip")
+        midhip_data = trc_file.marker("Hip")
         if midhip_data is None or len(midhip_data) == 0:
             raise ValueError("MidHip data is empty")
     except (KeyError, ValueError):
@@ -56,8 +57,25 @@ def get_midhip_data(trc_file):
         rhip_data = trc_file.marker("RHip")
         lhip_data = trc_file.marker("LHip")
         midhip_data = (rhip_data + lhip_data) / 2
+        trc_file.add_marker('Hip', *midhip_data.T)
 
-    return midhip_data
+    return trc_file
+
+
+def check_neck_data(trc_file):
+    try:
+        # Find Neck data
+        neck_data = trc_file.marker("Neck")
+        if neck_data is None or len(neck_data) == 0:
+            raise ValueError("Neck data is empty")
+    except (KeyError, ValueError):
+        # If Neck data is not found, calculate it from RShoulder and LShoulder
+        rshoulder_data = trc_file.marker("RShoulder")
+        lshoulder_data = trc_file.marker("LShoulder")
+        neck_data = (rshoulder_data + lshoulder_data) / 2
+        trc_file.add_marker('Neck', *neck_data.T)
+
+    return trc_file
 
 
 def augmentTRC(config_dict):
@@ -65,14 +83,10 @@ def augmentTRC(config_dict):
     project_dir = config_dict.get('project').get('project_dir')
     pathInputTRCFile = os.path.realpath(os.path.join(project_dir, 'pose-3d'))
     pathOutputTRCFile = os.path.realpath(os.path.join(project_dir, 'pose-3d'))
-    pose_model = config_dict.get('pose').get('pose_model')
-    subject_height = config_dict.get('markerAugmentation').get('participant_height')
-    if subject_height is None or subject_height == 0 or subject_height==0:
-        raise ValueError("Subject height is not set or invalid in the config file.")
-    subject_mass = config_dict.get('markerAugmentation').get('participant_mass')
-    if not type(subject_height) == list:
-        subject_height = [subject_height]
-        subject_mass = [subject_mass]
+    make_c3d = config_dict.get('markerAugmentation').get('make_c3d')
+    subject_height = config_dict.get('project').get('participant_height')
+    subject_mass = config_dict.get('project').get('participant_mass')
+    
     augmenterDir = os.path.dirname(utilsDataman.__file__)
     augmenterModelName = 'LSTM'
     augmenter_model = 'v0.3'
@@ -90,8 +104,29 @@ def augmentTRC(config_dict):
         trc_files = trc_filtering
     else:
         trc_files = trc_no_filtering
+    sorted(trc_files, key=natural_sort_key)
 
-    for p, pathInputTRCFile in enumerate(trc_files):
+    # Get subject heights and masses
+    if subject_height is None or subject_height == 0:
+        subject_height = [1.75] * len(trc_files)
+        logging.warning("No subject height found in Config.toml. Using default height of 1.75m.")
+    elif not type(subject_height) == list: # int or float
+        subject_height = [subject_height]
+    elif len(subject_height) < len(trc_files):
+        logging.warning("Number of subject heights does not match number of TRC files. Missing heights are set to 1.75m.")
+        subject_height += [1.75] * (len(trc_files) - len(subject_height))
+
+    if subject_mass is None or subject_mass == 0:
+        subject_mass = [70] * len(trc_files)
+        logging.warning("No subject mass found in Config.toml. Using default mass of 70kg.")
+    elif not type(subject_mass) == list:
+        subject_mass = [subject_mass]
+    elif len(subject_mass) < len(trc_files):
+        logging.warning("Number of subject masses does not match number of TRC files. Missing masses are set to 70kg.")
+        subject_mass += [70] * (len(trc_files) - len(subject_mass))
+
+    for p in range(len(subject_mass)):
+        pathInputTRCFile = trc_files[p]
         pathOutputTRCFile = os.path.splitext(pathInputTRCFile)[0] + '_LSTM.trc'
     
         # This is by default - might need to be adjusted in the future.
@@ -122,6 +157,11 @@ def augmentTRC(config_dict):
         except:
             raise ValueError('Cannot read TRC file. You may need to enable interpolation in Config.toml while triangulating.')
         
+        # add neck and midhip data if not in file
+        trc_file = check_midhip_data(trc_file)
+        trc_file = check_neck_data(trc_file)
+        trc_file.write(pathInputTRCFile)
+        
         # Verify that all feature markers are present in the TRC file.
         feature_markers_joined = set(feature_markers_all[0]+feature_markers_all[1])
         trc_markers = set(trc_file.marker_names)
@@ -144,16 +184,10 @@ def augmentTRC(config_dict):
             # %% Pre-process inputs.
             # Step 1: import .trc file with OpenPose marker trajectories.  
             trc_data = TRC2numpy(pathInputTRCFile, feature_markers)
-
-            # Calculate the midHip marker as the average of RHip and LHip
-            midhip_data = get_midhip_data(trc_file)
-
             trc_data_data = trc_data[:,1:]
 
             # Step 2: Normalize with reference marker position.
-            with open(os.path.join(augmenterModelDir, "metadata.json"), 'r') as f:
-                metadata = json.load(f)
-            referenceMarker_data = midhip_data  # instead of trc_file.marker(referenceMarker) # change by HunMin
+            referenceMarker_data = trc_file.marker("Hip")  # instead of trc_file.marker(referenceMarker) # change by HunMin
             norm_trc_data_data = np.zeros((trc_data_data.shape[0],
                                         trc_data_data.shape[1]))
             for i in range(0,trc_data_data.shape[1],3):
@@ -192,7 +226,10 @@ def augmentTRC(config_dict):
             json_file = open(os.path.join(augmenterModelDir, "model.json"), 'r')
             pretrainedModel_json = json_file.read()
             json_file.close()
-            model = tf.keras.models.model_from_json(pretrainedModel_json)
+            model = tf.keras.models.model_from_json(pretrainedModel_json, custom_objects={
+                                    'Sequential': tf.keras.models.Sequential,
+                                    'Dense': tf.keras.layers.Dense
+                                    })
             model.load_weights(os.path.join(augmenterModelDir, "weights.h5"))  
             outputs = model.predict(inputs)
             tf.keras.backend.clear_session()
@@ -245,7 +282,12 @@ def augmentTRC(config_dict):
         # %% Return augmented .trc file   
         trc_file.write(pathOutputTRCFile)
 
-        logging.info(f'Augmented marker coordinates are stored at {pathOutputTRCFile}.\n')
-    
+        logging.info(f'Augmented marker coordinates are stored at {pathOutputTRCFile}.')
+
+        # Save c3d
+        if make_c3d:
+            convert_to_c3d(pathOutputTRCFile)
+            logging.info(f'Augmented trc files have been converted to c3d.')
+            
     return min_y_pos
 

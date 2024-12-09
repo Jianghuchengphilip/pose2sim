@@ -1,4 +1,5 @@
 **/__pycache__/
+**/build/
 *.pyc
 logs.txt*
 **/*.log
@@ -8,7 +9,11 @@ dist/
 # **/*.mp4
 **/*.trc
 **/*.sto
+**/*.c3d
+**/*.json
 
 **/Calib_qualisys.toml
 **/pose-3d/
+**/pose/
+**/pose-sync/
 **/pose-associated/
